@@ -10,7 +10,7 @@ maxUploadSize = 200
 enableCORS = false
 enableXsrfProtection = false
 runOnSave = true
-pythonVersion = "3.11"
+pythonVersion = "3.11" 
 
 [browser]
 gatherUsageStats = false
