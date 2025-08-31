@@ -1,0 +1,5 @@
+To build the visual product matcher, I adopted a deep learning strategy focused on efficiency and accuracy. I began by sourcing a public fashion dataset from Kaggle. Using TensorFlow and a pre-trained ResNet50 model, I generated 2048-dimensional feature vectors (embeddings) for each product image, creating a numerical representation of its visual characteristics.
+
+To optimize the search functionality, I implemented a two-step process. First, I used the K-Means algorithm to group the image embeddings into 50 distinct clusters. When a user uploads an image, the application first identifies the closest product cluster and then performs a highly efficient Nearest Neighbors search only within that smaller subset. This ensures the results are both fast and visually relevant.
+
+The front-end was built with Streamlit for rapid, interactive development. The final application is mobile-responsive and includes user-friendly features like loading states, error handling, and results filtering, meeting all requirements of the technical assessment.
