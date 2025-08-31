@@ -10,6 +10,8 @@ maxUploadSize = 200
 enableCORS = false
 enableXsrfProtection = false
 runOnSave = true
+fileWatcherType = "none"
+
 
 [browser]
 gatherUsageStats = false
