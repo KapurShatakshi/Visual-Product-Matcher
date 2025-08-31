@@ -17,32 +17,37 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- Artifact Loading from Local Project Files ---
+# --- State Management Initialization ---
+# This dictionary will now store all our persistent data
+if 'app_state' not in st.session_state:
+    st.session_state.app_state = {
+        'initial_results_df': None,
+        'uploaded_image_display': None,
+        'last_source_id': None
+    }
+
+# --- Artifact Loading ---
 ARTIFACTS_DIR = "." 
-IMAGE_DIR = "images" # Define the image directory
+IMAGE_DIR = "images"
 
 @st.cache_resource
 def load_artifacts():
     """Loads all necessary artifacts and dynamically builds cluster models."""
     try:
-        # Load the core models and data files from your project directory
         extractor = tf.keras.models.load_model(os.path.join(ARTIFACTS_DIR, "feature_extractor.keras"))
         df = pd.read_csv(os.path.join(ARTIFACTS_DIR, "styles_deployment_sample.csv"))
         kmeans = joblib.load(os.path.join(ARTIFACTS_DIR, "kmeans.joblib"))
         emb_norm = np.load(os.path.join(ARTIFACTS_DIR, "emb_norm_sample.npy"))
         
-        # FIX: Create the correct image path, matching the notebook's logic
         df['image_path'] = df['id'].apply(lambda x: os.path.join(IMAGE_DIR, f"{x}.jpg"))
         
-        # Calculate centroids directly from the loaded kmeans model
+        # Dynamically create these to avoid errors
         centroids = kmeans.cluster_centers_
         centroids_norm = centroids.astype("float32") / (np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-10)
         
-        # FIX for IndexError: Dynamically create cluster mappings from the loaded sample data
         unique_clusters = sorted(df['cluster'].unique())
         cluster_to_idx_map = {c: df[df['cluster'] == c].index.to_numpy() for c in unique_clusters}
 
-        # Recreate the per-cluster Nearest Neighbor models in memory
         cluster_to_nn = {}
         for cluster_id, indices in cluster_to_idx_map.items():
             if len(indices) > 1:
@@ -56,13 +61,11 @@ def load_artifacts():
         return extractor, df, kmeans, centroids_norm, cluster_to_idx_map, cluster_to_nn
 
     except FileNotFoundError as e:
-        # Basic error handling for missing files
-        st.error(f"Error loading artifact: {e}. Please ensure all model and data files are in the main project directory.")
+        st.error(f"Error loading artifact: {e}. Ensure all model files are in the directory.")
         st.stop()
 
 # --- Helper Functions ---
 def load_and_preprocess_image(image_source, source_type='file'):
-    """Loads and preprocesses an image from a file or URL with error handling."""
     try:
         if source_type == 'url':
             response = requests.get(image_source, timeout=10)
@@ -71,8 +74,8 @@ def load_and_preprocess_image(image_source, source_type='file'):
         else: # file
             image = Image.open(image_source).convert("RGB")
         
-        image = image.resize((224, 224))
-        img_array = tf.keras.preprocessing.image.img_to_array(image)
+        image_resized = image.resize((224, 224))
+        img_array = tf.keras.preprocessing.image.img_to_array(image_resized)
         img_array_expanded = np.expand_dims(img_array, axis=0)
         return tf.keras.applications.resnet50.preprocess_input(img_array_expanded), image
     except Exception as e:
@@ -80,25 +83,25 @@ def load_and_preprocess_image(image_source, source_type='file'):
         return None, None
 
 def extract_embedding(image_tensor, extractor_model):
-    """Extracts and normalizes the feature embedding from an image."""
     embedding = extractor_model.predict(image_tensor, verbose=0)[0]
     embedding = embedding.astype("float32")
     embedding /= (np.linalg.norm(embedding) + 1e-10)
     return embedding
 
 def search_similar(query_embedding, df, kmeans, centroids_norm, cluster_to_idx_map, cluster_to_nn, top_k=12):
-    """Finds visually similar products using the notebook's two-step search logic."""
+    """Finds the top_k visually similar products using NearestNeighbors."""
     dists_to_centroids = 1.0 - (centroids_norm @ query_embedding)
     closest_cluster = int(np.argmin(dists_to_centroids))
     
-    nn_cluster = cluster_to_nn.get(closest_cluster)
+    nn_cluster = cluster_to_idx_map.get(closest_cluster)
     idx_pool = cluster_to_idx_map.get(closest_cluster, np.array([]))
+    
+    nn_model = cluster_to_nn.get(closest_cluster)
 
-    if nn_cluster is None or len(idx_pool) == 0:
-        st.warning("Could not find a matching product cluster. Please try a different image.")
+    if nn_model is None or len(idx_pool) == 0:
         return pd.DataFrame()
 
-    dist, ind = nn_cluster.kneighbors(query_embedding.reshape(1, -1), n_neighbors=min(top_k, len(idx_pool)))
+    dist, ind = nn_model.kneighbors(query_embedding.reshape(1, -1), n_neighbors=min(top_k, len(idx_pool)))
     
     hits_indices = idx_pool[ind[0]]
     distances = dist[0]
@@ -112,46 +115,62 @@ def search_similar(query_embedding, df, kmeans, centroids_norm, cluster_to_idx_m
 st.title("👕 Visual Product Matcher")
 st.write("Upload an image or provide a URL to find visually similar fashion products.")
 
-with st.spinner("Loading models and product catalog..."):
-    extractor, df, kmeans, centroids_norm, cluster_to_idx_map, cluster_to_nn = load_artifacts()
+extractor, df, kmeans, centroids_norm, cluster_to_idx_map, cluster_to_nn = load_artifacts()
 
 st.sidebar.header("Search Options")
 input_method = st.sidebar.radio("Input method:", ("Upload an Image", "Enter Image URL"))
 
-query_image, uploaded_image_display = None, None
+uploaded_file = None
+url = None
 
 if input_method == "Upload an Image":
     uploaded_file = st.sidebar.file_uploader("Choose a file...", type=["jpg", "jpeg", "png"])
-    if uploaded_file:
-        query_image, uploaded_image_display = load_and_preprocess_image(uploaded_file, source_type='file')
 else:
     url = st.sidebar.text_input("Enter image URL:")
-    if url:
-        query_image, uploaded_image_display = load_and_preprocess_image(url, source_type='url')
+
+# --- Logic to handle new image upload and perform search ONCE ---
+source = uploaded_file if uploaded_file else url
+if source:
+    source_id = source.name if uploaded_file else source
+    # Only re-process if the image has changed
+    if st.session_state.app_state['last_source_id'] != source_id:
+        st.session_state.app_state['last_source_id'] = source_id
         
+        source_type = 'file' if uploaded_file else 'url'
+        query_image_tensor, uploaded_image_display = load_and_preprocess_image(source, source_type)
+        
+        if query_image_tensor is not None:
+            st.session_state.app_state['uploaded_image_display'] = uploaded_image_display
+            with st.spinner("Analyzing image and finding top matches..."):
+                query_embedding = extract_embedding(query_image_tensor, extractor)
+                st.session_state.app_state['initial_results_df'] = search_similar(
+                    query_embedding, df, kmeans, centroids_norm, cluster_to_idx_map, cluster_to_nn
+                )
+
+# --- Layout and Display ---
 col1, col2 = st.columns([1, 3])
 
-if uploaded_image_display:
-    with col1:
+with col1:
+    if st.session_state.app_state['uploaded_image_display']:
         st.header("Your Image")
-        st.image(uploaded_image_display, use_column_width=True) # <-- FIX: Changed to use_column_width
-        search_button = st.button("Find Similar Products", type="primary")
-else:
-    search_button = False
+        st.image(st.session_state.app_state['uploaded_image_display'], use_container_width=True)
 
 with col2:
-    if search_button and query_image is not None:
+    if st.session_state.app_state.get('initial_results_df') is not None:
         st.header("Similar Products")
-        with st.spinner("Searching for matches..."):
-            query_embedding = extract_embedding(query_image, extractor)
-            results = search_similar(query_embedding, df, kmeans, centroids_norm, cluster_to_idx_map, cluster_to_nn)
+        
+        results_df = st.session_state.app_state['initial_results_df']
+        
+        if results_df.empty:
+            st.warning("No similar products found. Please try another image.")
+        else:
+            # The slider now only filters the pre-fetched results
+            min_similarity = st.slider("Filter results by similarity score:", 0.0, 1.0, 0.0, 0.01)
             
-            min_similarity = st.slider("Filter by Similarity Score:", 0.0, 1.0, 0.5, 0.01)
-            max_dist_filter = 1 - min_similarity
-            filtered_results = results[results['cosine_distance'] <= max_dist_filter]
+            filtered_results = results_df[results_df['similarity_score'] >= min_similarity]
 
             if filtered_results.empty:
-                st.warning("No results match the current filter. Try lowering the similarity score.")
+                st.info("No products match the current filter. Slide down to see more results.")
             else:
                 num_cols = 4
                 num_rows = math.ceil(len(filtered_results) / num_cols)
@@ -164,16 +183,14 @@ with col2:
                             with row_cols[j]:
                                 image_path = product.get('image_path', '')
                                 if os.path.exists(image_path):
-                                    st.image(image_path, use_column_width=True) # <-- FIX: Changed to use_column_width
+                                    st.image(image_path, use_container_width=True)
                                 else:
-                                    st.warning(f"Img not found: {image_path}")
+                                    st.warning(f"Img not found")
                                 
                                 st.markdown(f"**{product.get('productDisplayName', 'N/A')}**")
-                                st.markdown(f"_{product.get('masterCategory', '')} / {product.get('articleType', '')}_")
-                                
                                 st.progress(int(product['similarity_score'] * 100))
                                 st.caption(f"Similarity: {product['similarity_score']:.2f}")
+    else:
+        st.info("Upload an image or enter a URL in the sidebar to begin.")
 
-    elif not uploaded_image_display:
-        st.info("Upload an image or enter a URL in the sidebar to start.")
 
